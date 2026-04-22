@@ -158,7 +158,7 @@ async function callOpenAI(prompt) {
     body: JSON.stringify({
       model: "gpt-4o",
       temperature: 0,
-      max_tokens: 4000,
+      max_tokens: 8000,
       response_format: { type: "json_object" },
       messages: [
         {
@@ -184,6 +184,27 @@ async function callOpenAI(prompt) {
   try {
     return JSON.parse(clean);
   } catch {
+    // Response was likely truncated — try to salvage partial result for Slack alert
+    console.warn("⚠️  OpenAI response was truncated, attempting partial recovery...");
+
+    const severityMatch = clean.match(/"severity"\s*:\s*"(NONE|LOW|MEDIUM|HIGH|CRITICAL)"/);
+    const summaryMatch  = clean.match(/"summary"\s*:\s*"([^"]+)"/);
+    const cleanMatch    = clean.match(/"clean"\s*:\s*(true|false)/);
+
+    if (severityMatch) {
+      console.warn("   Recovered partial result from truncated response.");
+      const sev = severityMatch[1];
+      return {
+        clean: cleanMatch ? cleanMatch[1] === "true" : false,
+        severity: sev,
+        summary: summaryMatch ? summaryMatch[1] : "Scan completed but response was truncated — manual review recommended.",
+        findings: [],
+        risk_score: sev === "CRITICAL" ? 90 : sev === "HIGH" ? 70 : sev === "MEDIUM" ? 40 : 10,
+        immediate_action_required: ["CRITICAL", "HIGH"].includes(sev),
+        notes: "⚠️ OpenAI response was truncated. Findings list may be incomplete. Full diff review is recommended.",
+      };
+    }
+
     throw new Error(`Failed to parse OpenAI response as JSON: ${clean.slice(0, 500)}`);
   }
 }
@@ -458,6 +479,29 @@ async function main() {
     result = await callOpenAI(prompt);
   } catch (err) {
     console.error("❌ OpenAI analysis failed:", err.message);
+
+    // Still send a Slack alert so the team knows the scan failed
+    try {
+      await sendSlack({
+        text: "⚠️ Security Scanner Error",
+        blocks: [
+          {
+            type: "header",
+            text: { type: "plain_text", text: "⚠️ Security Scan Failed", emoji: true },
+          },
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `*Repository:* ${context.repo}\n*Actor:* ${context.actor}\n*Branch:* ${context.ref}\n\n❌ The AI security scanner failed to complete:\n\`\`\`${err.message.slice(0, 500)}\`\`\`\n\n⚠️ *Manual review of this commit is recommended.*`,
+            },
+          },
+        ],
+      });
+    } catch (slackErr) {
+      console.error("❌ Also failed to send Slack error alert:", slackErr.message);
+    }
+
     process.exit(1);
   }
 
