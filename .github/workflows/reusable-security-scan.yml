@@ -1,0 +1,132 @@
+name: 🔐 Security Scanner (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      severity_threshold:
+        description: "Minimum severity to alert on: LOW, MEDIUM, HIGH, CRITICAL"
+        required: false
+        default: "MEDIUM"
+        type: string
+      scan_depth:
+        description: "Number of commits to scan on push (default: 1)"
+        required: false
+        default: "1"
+        type: string
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+
+jobs:
+  security-scan:
+    name: 🛡️ AI Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50 # enough history to diff
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          cd $GITHUB_ACTION_PATH
+          npm install --prefix /tmp/scanner node-fetch@3
+
+      - name: Download scanner script
+        run: |
+          curl -sSL https://raw.githubusercontent.com/${{ github.repository_owner }}/.github-security/main/scripts/scan.js \
+            -o /tmp/scanner/scan.js
+
+      - name: Generate git diff
+        id: diff
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin ${{ github.base_ref }} --depth=50
+            DIFF=$(git diff origin/${{ github.base_ref }}...HEAD -- . \
+              ':(exclude)*.lock' \
+              ':(exclude)package-lock.json' \
+              ':(exclude)yarn.lock' \
+              ':(exclude)*.min.js' \
+              ':(exclude)dist/**' \
+              ':(exclude).next/**' \
+              2>/dev/null | head -c 80000)
+          else
+            DEPTH="${{ inputs.scan_depth }}"
+            DIFF=$(git diff HEAD~${DEPTH}..HEAD -- . \
+              ':(exclude)*.lock' \
+              ':(exclude)package-lock.json' \
+              ':(exclude)yarn.lock' \
+              ':(exclude)*.min.js' \
+              ':(exclude)dist/**' \
+              ':(exclude).next/**' \
+              2>/dev/null | head -c 80000)
+          fi
+
+          # Save diff to file to avoid env size limits
+          echo "$DIFF" > /tmp/scanner/diff.txt
+          DIFF_SIZE=$(wc -c < /tmp/scanner/diff.txt)
+          echo "diff_size=$DIFF_SIZE" >> $GITHUB_OUTPUT
+          echo "Diff size: $DIFF_SIZE bytes"
+
+      - name: Get commit metadata
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            COMMITS=$(git log origin/${{ github.base_ref }}...HEAD \
+              --pretty=format:'%H|%an|%ae|%s' | head -20)
+            FILES_CHANGED=$(git diff origin/${{ github.base_ref }}...HEAD \
+              --name-only | head -50 | tr '\n' ',')
+          else
+            DEPTH="${{ inputs.scan_depth }}"
+            COMMITS=$(git log HEAD~${DEPTH}..HEAD \
+              --pretty=format:'%H|%an|%ae|%s' | head -20)
+            FILES_CHANGED=$(git diff HEAD~${DEPTH}..HEAD \
+              --name-only | head -50 | tr '\n' ',')
+          fi
+          echo "commits<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
+
+      - name: Run AI Security Scan
+        id: scan
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          COMMITS_META: ${{ steps.meta.outputs.commits }}
+          FILES_CHANGED: ${{ steps.meta.outputs.files_changed }}
+          SEVERITY_THRESHOLD: ${{ inputs.severity_threshold }}
+        run: node /tmp/scanner/scan.js
+
+      - name: Report scan result
+        if: always()
+        run: |
+          echo "### 🔐 Security Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Event:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Actor:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Diff size:** ${{ steps.diff.outputs.diff_size }} bytes" >> $GITHUB_STEP_SUMMARY
+          if [ -f /tmp/scanner/result.txt ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            cat /tmp/scanner/result.txt >> $GITHUB_STEP_SUMMARY
+          fi
