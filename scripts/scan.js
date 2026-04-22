@@ -121,8 +121,6 @@ RESPOND IN THIS EXACT JSON FORMAT (no markdown, no preamble):
 
 // ─── Call OpenAI API ───────────────────────────────────────────────────────
 async function callOpenAI(prompt) {
-  const { default: fetch } = await import("node-fetch");
-
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -334,8 +332,6 @@ function buildSlackMessage(result, context) {
 
 // ─── Send Slack notification ───────────────────────────────────────────────
 async function sendSlack(payload) {
-  const { default: fetch } = await import("node-fetch");
-
   // Attach the channel ID to the payload (required for chat.postMessage)
   const body = {
     channel: SLACK_CHANNEL_ID,
