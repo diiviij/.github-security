@@ -1,9 +1,3 @@
-/**
- * 🔐 AI-Powered Git Security Scanner
- * Uses OpenAI GPT-4o to analyze git diffs for security threats
- * Sends detailed Slack alerts on suspicious findings
- */
-
 const fs = require("fs");
 const path = require("path");
 
@@ -20,6 +14,34 @@ function getDiff() {
   if (!fs.existsSync(diffPath)) return "";
   const diff = fs.readFileSync(diffPath, "utf8").trim();
   return diff || "";
+}
+
+// ─── Compress diff to reduce token usage ──────────────────────────────────
+function compressDiff(diff, maxChars = 12000) {
+  const lines = diff.split("\n");
+
+  // Keep only meaningful lines: file headers, hunks, and changed lines (+/-)
+  const filtered = lines.filter((line) => {
+    return (
+      line.startsWith("diff --git") ||
+      line.startsWith("+++") ||
+      line.startsWith("---") ||
+      line.startsWith("@@") ||
+      line.startsWith("+") ||
+      line.startsWith("-")
+    );
+  });
+
+  let compressed = filtered.join("\n");
+
+  // If still too large, truncate with a notice
+  if (compressed.length > maxChars) {
+    compressed =
+      compressed.slice(0, maxChars) +
+      `\n\n... [diff truncated at ${maxChars} chars to fit token limit] ...`;
+  }
+
+  return compressed;
 }
 
 // ─── Build the security analysis prompt ───────────────────────────────────
@@ -126,258 +148,215 @@ RESPOND IN THIS EXACT JSON FORMAT (no markdown, no preamble):
 }
 
 // ─── Call OpenAI API ───────────────────────────────────────────────────────
-// ─── Sleep helper ─────────────────────────────────────────────────────────
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+async function callOpenAI(prompt) {
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      temperature: 0,
+      max_tokens: 8000,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: "You are an expert security engineer. You respond only in valid JSON — no markdown, no preamble, no explanation outside the JSON object.",
+        },
+        { role: "user", content: prompt },
+      ],
+    }),
+  });
 
-// ─── Call OpenAI API with retry + exponential backoff on 429 ──────────────
-async function callOpenAI(prompt, retries = 4) {
-  const { default: fetch } = await import("node-fetch");
-
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    console.log(`🤖 OpenAI attempt ${attempt}/${retries}...`);
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        temperature: 0,
-        max_tokens: 4000,
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content: "You are an expert security engineer. You respond only in valid JSON — no markdown, no preamble, no explanation outside the JSON object.",
-          },
-          { role: "user", content: prompt },
-        ],
-      }),
-    });
-
-    // ── Rate limited (429) — wait and retry ─────────────────────────────
-    if (response.status === 429) {
-      // Respect Retry-After header if OpenAI sends one, else use backoff
-      const retryAfter = response.headers.get("retry-after");
-      const waitSeconds = retryAfter
-        ? parseInt(retryAfter, 10) + 2          // header + 2s buffer
-        : Math.min(15 * Math.pow(2, attempt - 1), 120); // 15s, 30s, 60s, 120s
-
-      console.warn(`⚠️  Rate limited (429). Waiting ${waitSeconds}s before retry ${attempt}/${retries}...`);
-      await sleep(waitSeconds * 1000);
-      continue; // retry
-    }
-
-    // ── Server errors (500/502/503) — short wait and retry ───────────────
-    if (response.status >= 500) {
-      const waitSeconds = 10 * attempt;
-      console.warn(`⚠️  Server error ${response.status}. Waiting ${waitSeconds}s...`);
-      await sleep(waitSeconds * 1000);
-      continue;
-    }
-
-    // ── Any other non-OK ─────────────────────────────────────────────────
-    if (!response.ok) {
-      const err = await response.text();
-      throw new Error(`OpenAI API error ${response.status}: ${err}`);
-    }
-
-    // ── Success ──────────────────────────────────────────────────────────
-    const data = await response.json();
-    const text = data.choices?.[0]?.message?.content || "";
-    const clean = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-
-    try {
-      return JSON.parse(clean);
-    } catch {
-      // Truncated response — try partial recovery
-      console.warn("⚠️  Response truncated, attempting partial recovery...");
-      const severityMatch = clean.match(/"severity"\s*:\s*"(NONE|LOW|MEDIUM|HIGH|CRITICAL)"/);
-      const summaryMatch  = clean.match(/"summary"\s*:\s*"([^"]+)"/);
-      const cleanMatch    = clean.match(/"clean"\s*:\s*(true|false)/);
-      if (severityMatch) {
-        const sev = severityMatch[1];
-        return {
-          clean: cleanMatch?.[1] === "true" ?? false,
-          severity: sev,
-          summary: summaryMatch?.[1] ?? "Scan response was truncated — manual review recommended.",
-          findings: [],
-          risk_score: sev === "CRITICAL" ? 90 : sev === "HIGH" ? 70 : sev === "MEDIUM" ? 40 : 10,
-          immediate_action_required: ["CRITICAL", "HIGH"].includes(sev),
-          notes: "⚠️ OpenAI response was truncated. Findings list may be incomplete.",
-        };
-      }
-      throw new Error(`Failed to parse OpenAI response: ${clean.slice(0, 300)}`);
-    }
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`OpenAI API error ${response.status}: ${err}`);
   }
 
-  throw new Error(`OpenAI API failed after ${retries} attempts (rate limit or server error).`);
+  const data = await response.json();
+  const text = data.choices?.[0]?.message?.content || "";
+
+  // Strip any stray markdown fences just in case
+  const clean = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+
+  try {
+    return JSON.parse(clean);
+  } catch {
+    // Response was likely truncated — try to salvage partial result for Slack alert
+    console.warn("⚠️  OpenAI response was truncated, attempting partial recovery...");
+
+    const severityMatch = clean.match(/"severity"\s*:\s*"(NONE|LOW|MEDIUM|HIGH|CRITICAL)"/);
+    const summaryMatch  = clean.match(/"summary"\s*:\s*"([^"]+)"/);
+    const cleanMatch    = clean.match(/"clean"\s*:\s*(true|false)/);
+
+    if (severityMatch) {
+      console.warn("   Recovered partial result from truncated response.");
+      const sev = severityMatch[1];
+      return {
+        clean: cleanMatch ? cleanMatch[1] === "true" : false,
+        severity: sev,
+        summary: summaryMatch ? summaryMatch[1] : "Scan completed but response was truncated — manual review recommended.",
+        findings: [],
+        risk_score: sev === "CRITICAL" ? 90 : sev === "HIGH" ? 70 : sev === "MEDIUM" ? 40 : 10,
+        immediate_action_required: ["CRITICAL", "HIGH"].includes(sev),
+        notes: "⚠️ OpenAI response was truncated. Findings list may be incomplete. Full diff review is recommended.",
+      };
+    }
+
+    throw new Error(`Failed to parse OpenAI response as JSON: ${clean.slice(0, 500)}`);
+  }
 }
 
-// ─── Format Slack message ──────────────────────────────────────────────────
+// ─── Slack helpers ────────────────────────────────────────────────────────
+const SEVERITY_META = {
+  NONE:     { emoji: "✅", color: "#2EB67D", label: "CLEAN",    bar: "░░░░░░░░░░" },
+  LOW:      { emoji: "🟡", color: "#F2C744", label: "LOW",      bar: "██░░░░░░░░" },
+  MEDIUM:   { emoji: "🟠", color: "#E8812A", label: "MEDIUM",   bar: "████░░░░░░" },
+  HIGH:     { emoji: "🔴", color: "#E01E5A", label: "HIGH",     bar: "███████░░░" },
+  CRITICAL: { emoji: "🚨", color: "#6B0F1A", label: "CRITICAL", bar: "██████████" },
+};
+
+const CATEGORY_META = {
+  BACKDOOR:        { emoji: "🚪", label: "Backdoor / Remote Access" },
+  CRYPTO_INJECTION:{ emoji: "🪙", label: "Crypto / Blockchain Injection" },
+  DATA_EXFIL:      { emoji: "📤", label: "Data Exfiltration" },
+  SECRET:          { emoji: "🔑", label: "Hardcoded Secret / Credential" },
+  OBFUSCATION:     { emoji: "🎭", label: "Obfuscation / Encoding" },
+  SUPPLY_CHAIN:    { emoji: "📦", label: "Supply Chain Attack" },
+  STEALTH:         { emoji: "🕵️",  label: "Stealth / Persistence" },
+  NETWORK:         { emoji: "🌐", label: "Suspicious Network Activity" },
+  OTHER:           { emoji: "⚠️",  label: "Other" },
+};
+
+function riskBar(score) {
+  const filled = Math.round(score / 10);
+  return "█".repeat(filled) + "░".repeat(10 - filled) + `  ${score}/100`;
+}
+
+function plural(n, word) {
+  return `${n} ${word}${n !== 1 ? "s" : ""}`;
+}
+
+// ─── Build corporate-grade Slack message ──────────────────────────────────
 function buildSlackMessage(result, context) {
-  const isPassed  = result.severity === "NONE" || result.clean;
-  const isCrit    = result.severity === "CRITICAL";
-  const isHigh    = result.severity === "HIGH";
+  const isClean    = result.severity === "NONE" || result.clean;
+  const meta       = SEVERITY_META[result.severity] || SEVERITY_META.MEDIUM;
+  const commitUrl  = `${context.serverUrl}/${context.repo}/commit/${context.sha}`;
+  const actionUrl  = `${context.serverUrl}/${context.repo}/actions/runs/${context.runId}`;
+  const repoUrl    = `${context.serverUrl}/${context.repo}`;
+  const shortSha   = context.sha?.slice(0, 8) || "unknown";
+  const branch     = context.ref?.replace("refs/heads/", "") || "unknown";
+  const timestamp  = Math.floor(Date.now() / 1000);
+  const findCount  = result.findings?.length || 0;
 
-  const SEVERITY_CONFIG = {
-    NONE:     { emoji: "✅", label: "PASSED",   bar: "▓▓▓▓▓▓▓▓▓▓", color: "good" },
-    LOW:      { emoji: "🟡", label: "LOW",       bar: "▓▓░░░░░░░░", color: "warning" },
-    MEDIUM:   { emoji: "🟠", label: "MEDIUM",    bar: "▓▓▓▓▓░░░░░", color: "warning" },
-    HIGH:     { emoji: "🔴", label: "HIGH",      bar: "▓▓▓▓▓▓▓▓░░", color: "danger" },
-    CRITICAL: { emoji: "🚨", label: "CRITICAL",  bar: "▓▓▓▓▓▓▓▓▓▓", color: "danger" },
-  };
-
-  const CATEGORY_META = {
-    BACKDOOR:         { emoji: "🚪", label: "Backdoor / Remote Access" },
-    CRYPTO_INJECTION: { emoji: "🪙", label: "Crypto / Blockchain Injection" },
-    DATA_EXFIL:       { emoji: "📤", label: "Data Exfiltration" },
-    SECRET:           { emoji: "🔑", label: "Hardcoded Secret" },
-    OBFUSCATION:      { emoji: "🎭", label: "Obfuscation / Encoding" },
-    SUPPLY_CHAIN:     { emoji: "📦", label: "Supply Chain Attack" },
-    STEALTH:          { emoji: "🕵️", label: "Stealth / Persistence" },
-    NETWORK:          { emoji: "🌐", label: "Suspicious Network Activity" },
-    OTHER:            { emoji: "⚠️", label: "Other" },
-  };
-
-  const sev       = SEVERITY_CONFIG[result.severity] || SEVERITY_CONFIG.NONE;
-  const commitUrl = `${context.serverUrl}/${context.repo}/commit/${context.sha}`;
-  const actionUrl = `${context.serverUrl}/${context.repo}/actions/runs/${context.runId}`;
-  const repoUrl   = `${context.serverUrl}/${context.repo}`;
-  const shortSha  = context.sha?.slice(0, 8) || "unknown";
-  const branch    = context.ref?.replace("refs/heads/", "") || "unknown";
-  const findCount = result.findings?.length || 0;
-  const now       = new Date().toUTCString();
-
-  // ── Risk score bar (10 segments) ────────────────────────────────────────
-  const score     = Math.min(100, Math.max(0, result.risk_score || 0));
-  const filled    = Math.round(score / 10);
-  const riskBar   = "█".repeat(filled) + "░".repeat(10 - filled);
-  const riskLabel = score >= 80 ? "🔴" : score >= 50 ? "🟠" : score >= 20 ? "🟡" : "🟢";
-
-  // ── Fallback plain text (for notifications / clients without block support)
-  const fallbackText = isPassed
+  // ── Fallback text (notifications / previews) ──
+  const fallbackText = isClean
     ? `✅ [${context.repo}] Security scan passed — no issues found`
-    : `${sev.emoji} [${context.repo}] ${sev.label} security alert — ${findCount} finding(s) | Risk: ${score}/100`;
+    : `${meta.emoji} [${context.repo}] ${meta.label} severity alert — ${plural(findCount, "finding")} detected by AI Security Scanner`;
 
-  const blocks = [];
-
-  // ════════════════════════════════════════════════════
-  // SECTION 1 — STATUS BANNER
-  // ════════════════════════════════════════════════════
-  blocks.push({
-    type: "header",
-    text: {
-      type: "plain_text",
-      emoji: true,
-      text: isPassed
-        ? "✅  Security Scan Passed — No Issues Found"
-        : `${sev.emoji}  Security Alert  ·  ${sev.label}  ·  ${findCount} Finding${findCount !== 1 ? "s" : ""}`,
+  // ══════════════════════════════════════════════════════════
+  // BLOCK 1 — Status Banner
+  // ══════════════════════════════════════════════════════════
+  const blocks = [
+    {
+      type: "header",
+      text: {
+        type: "plain_text",
+        text: isClean
+          ? "✅  Security Scan — All Clear"
+          : `${meta.emoji}  Security Alert  ·  ${meta.label} Severity`,
+        emoji: true,
+      },
     },
-  });
-
-  // Summary sentence
-  blocks.push({
-    type: "section",
-    text: {
-      type: "mrkdwn",
-      text: isPassed
-        ? `>_${result.summary || "All checks passed. No security issues detected in this commit."}_`
-        : `>${result.summary}`,
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `> ${result.summary}`,
+      },
     },
-  });
+    { type: "divider" },
 
-  blocks.push({ type: "divider" });
-
-  // ════════════════════════════════════════════════════
-  // SECTION 2 — COMMIT METADATA (2-column grid)
-  // ════════════════════════════════════════════════════
-  blocks.push({
-    type: "section",
-    fields: [
-      { type: "mrkdwn", text: `*📦 Repository*\n<${repoUrl}|${context.repo}>` },
-      { type: "mrkdwn", text: `*👤 Pushed By*\n\`${context.actor}\`` },
-      { type: "mrkdwn", text: `*🔀 Branch*\n\`${branch}\`` },
-      { type: "mrkdwn", text: `*#️⃣ Commit*\n<${commitUrl}|\`${shortSha}\`>` },
-      { type: "mrkdwn", text: `*⚡ Trigger*\n\`${context.eventName}\`` },
-      { type: "mrkdwn", text: `*🕐 Scanned At*\n${now}` },
-    ],
-  });
-
-  // ════════════════════════════════════════════════════
-  // SECTION 3 — RISK SCORE METER
-  // ════════════════════════════════════════════════════
-  blocks.push({
-    type: "section",
-    text: {
-      type: "mrkdwn",
-      text: `*Risk Score*\n${riskLabel} \`${riskBar}\` *${score}/100*`,
+    // ── BLOCK 2 — Scan Metadata grid ──
+    {
+      type: "section",
+      fields: [
+        { type: "mrkdwn", text: `*📁  Repository*\n<${repoUrl}|${context.repo}>` },
+        { type: "mrkdwn", text: `*👤  Triggered By*\n\`${context.actor}\`` },
+        { type: "mrkdwn", text: `*🔀  Branch*\n\`${branch}\`` },
+        { type: "mrkdwn", text: `*🔖  Commit*\n<${commitUrl}|\`${shortSha}\`>` },
+        { type: "mrkdwn", text: `*⚡  Event*\n\`${context.eventName}\`` },
+        { type: "mrkdwn", text: `*🕐  Scanned At*\n<!date^${timestamp}^{date_short_pretty} {time}|${new Date().toUTCString()}>` },
+      ],
     },
-  });
 
-  // Files changed (compact, single line)
+    // ── BLOCK 3 — Risk Score ──
+    {
+      type: "section",
+      fields: [
+        {
+          type: "mrkdwn",
+          text: `*🎯  Risk Score*\n\`${riskBar(result.risk_score)}\``,
+        },
+        {
+          type: "mrkdwn",
+          text: `*🔍  Findings*\n\`${plural(findCount, "issue")} detected\``,
+        },
+      ],
+    },
+  ];
+
+  // ── BLOCK 4 — Files changed ──
   if (context.filesChanged) {
-    const files = context.filesChanged
+    const fileList = context.filesChanged
       .split(",")
       .map((f) => f.trim())
       .filter(Boolean);
-    const shown  = files.slice(0, 6).map((f) => `\`${f}\``).join("  ");
-    const extra  = files.length > 6 ? `  _+${files.length - 6} more_` : "";
+    const shown    = fileList.slice(0, 8).map((f) => `\`${f}\``).join("  ·  ");
+    const extra    = fileList.length > 8 ? `  _+${fileList.length - 8} more_` : "";
     blocks.push({
       type: "section",
-      text: { type: "mrkdwn", text: `*📁 Files Changed*\n${shown}${extra}` },
+      text: { type: "mrkdwn", text: `*📂  Files Changed*\n${shown}${extra}` },
     });
   }
 
-  // ════════════════════════════════════════════════════
-  // SECTION 4 — FINDINGS (one clean card each)
-  // ════════════════════════════════════════════════════
+  // ══════════════════════════════════════════════════════════
+  // FINDINGS SECTION
+  // ══════════════════════════════════════════════════════════
   if (findCount > 0) {
     blocks.push({ type: "divider" });
-
     blocks.push({
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*🔍 Findings  ·  ${findCount} issue${findCount !== 1 ? "s" : ""} detected*`,
+        text: `*🔎  ${plural(findCount, "Security Finding")} Detected*`,
       },
     });
 
-    result.findings.slice(0, 6).forEach((f, i) => {
-      const cat    = CATEGORY_META[f.category] || CATEGORY_META.OTHER;
-      const sevCfg = SEVERITY_CONFIG[f.severity] || SEVERITY_CONFIG.NONE;
+    result.findings.slice(0, 6).forEach((f, idx) => {
+      const catMeta  = CATEGORY_META[f.category] || CATEGORY_META.OTHER;
+      const sevMeta  = SEVERITY_META[f.severity]  || SEVERITY_META.MEDIUM;
+      const location = f.lines ? `lines ${f.lines}` : "";
 
-      // Each finding = header line + detail fields
+      // Finding header + detail as a single section
       blocks.push({
         type: "section",
         text: {
           type: "mrkdwn",
           text: [
-            `*${i + 1}. ${cat.emoji} ${f.title}*`,
-            `${sevCfg.emoji} *${f.severity}*  ·  ${cat.label}  ·  \`${f.file}\`${f.lines ? `  lines ${f.lines}` : ""}`,
-          ].join("\n"),
+            `*${idx + 1}. ${sevMeta.emoji} [${f.severity}]  ${catMeta.emoji}  ${f.title}*`,
+            `*Category:* ${catMeta.label}   |   *File:* \`${f.file}\` ${location}`,
+            `*Detail:* ${f.description}`,
+            f.evidence ? `\`\`\`${f.evidence.slice(0, 300)}\`\`\`` : null,
+            `*Recommendation:* ${f.recommendation}`,
+          ].filter(Boolean).join("\n"),
         },
       });
 
-      // Description + evidence + fix as 3 tidy fields
-      const detailLines = [];
-      if (f.description) detailLines.push(`*What it does*\n${f.description}`);
-      if (f.evidence)    detailLines.push(`*Evidence*\n\`\`\`${f.evidence.slice(0, 180)}\`\`\``);
-      if (f.recommendation) detailLines.push(`*Recommendation*\n${f.recommendation}`);
-
-      if (detailLines.length > 0) {
-        blocks.push({
-          type: "section",
-          text: { type: "mrkdwn", text: detailLines.join("\n\n") },
-        });
-      }
-
-      // Thin separator between findings (but not after the last one)
-      if (i < Math.min(findCount, 6) - 1) {
+      // Thin divider between findings (skip after last)
+      if (idx < Math.min(findCount, 6) - 1) {
         blocks.push({ type: "divider" });
       }
     });
@@ -385,86 +364,160 @@ function buildSlackMessage(result, context) {
     if (findCount > 6) {
       blocks.push({
         type: "context",
-        elements: [{
-          type: "mrkdwn",
-          text: `_${findCount - 6} more finding(s) not shown — <${actionUrl}|view full report>_`,
-        }],
+        elements: [
+          {
+            type: "mrkdwn",
+            text: `_${findCount - 6} additional finding${findCount - 6 !== 1 ? "s" : ""} not shown — view the full Action run for complete details._`,
+          },
+        ],
       });
     }
   }
 
-  // ════════════════════════════════════════════════════
-  // SECTION 5 — ACTION BANNER (only on urgent findings)
-  // ════════════════════════════════════════════════════
+  // ── BLOCK — Immediate Action Banner ──
   if (result.immediate_action_required) {
     blocks.push({ type: "divider" });
     blocks.push({
       type: "section",
       text: {
         type: "mrkdwn",
-        text: [
-          `*🚨 Immediate Action Required*`,
-          `This commit contains a *${result.severity}* severity issue.`,
-          `Review and consider reverting before it reaches production.`,
-        ].join("\n"),
+        text: "🚨  *IMMEDIATE ACTION REQUIRED*\nThis commit may contain a critical security threat. Review and consider reverting before it reaches a production environment.",
       },
     });
   }
 
-  // Notes (only if present and non-trivial)
-  if (result.notes && result.notes.length > 10) {
+  // ── BLOCK — Notes ──
+  if (result.notes) {
     blocks.push({
-      type: "section",
-      text: { type: "mrkdwn", text: `📋 *Note:* _${result.notes}_` },
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `📋  *Analyst Notes:* ${result.notes}` }],
     });
   }
 
-  // ════════════════════════════════════════════════════
-  // SECTION 6 — ACTION BUTTONS + FOOTER
-  // ════════════════════════════════════════════════════
+  // ── BLOCK — Action Buttons ──
   blocks.push({ type: "divider" });
-
   blocks.push({
     type: "actions",
     elements: [
       {
         type: "button",
-        text: { type: "plain_text", text: "View Commit", emoji: true },
+        text: { type: "plain_text", text: "🔍 View Commit", emoji: true },
         url: commitUrl,
-        style: (isCrit || isHigh) ? "danger" : "primary",
+        style: result.immediate_action_required ? "danger" : "primary",
       },
       {
         type: "button",
-        text: { type: "plain_text", text: "View Action Run", emoji: true },
+        text: { type: "plain_text", text: "⚙️ Action Run Log", emoji: true },
         url: actionUrl,
       },
       {
         type: "button",
-        text: { type: "plain_text", text: "View Repository", emoji: true },
+        text: { type: "plain_text", text: "📁 Repository", emoji: true },
         url: repoUrl,
       },
     ],
   });
 
+  // ── BLOCK — Footer ──
   blocks.push({
     type: "context",
     elements: [
-      { type: "mrkdwn", text: `🤖 *GPT-4o Security Scanner*  ·  ${context.repo}  ·  ${now}` },
+      {
+        type: "mrkdwn",
+        text: `🤖  *AI Security Scanner*  ·  Powered by OpenAI GPT-4o  ·  Run <${actionUrl}|#${context.runId}>  ·  <!date^${timestamp}^{date_short_pretty} at {time}|${new Date().toUTCString()}>`,
+      },
     ],
   });
 
-  return { text: fallbackText, blocks };
+  // ══════════════════════════════════════════════════════════
+  // ATTACHMENT — provides the left-side color stripe
+  // ══════════════════════════════════════════════════════════
+  const attachments = [
+    {
+      color: meta.color,
+      fallback: fallbackText,
+    },
+  ];
+
+  return {
+    text: fallbackText,
+    blocks,
+    attachments,
+  };
+}
+
+// ─── Build Slack error alert ───────────────────────────────────────────────
+function buildErrorMessage(context, errMessage) {
+  const repoUrl   = `${context.serverUrl}/${context.repo}`;
+  const commitUrl = `${context.serverUrl}/${context.repo}/commit/${context.sha}`;
+  const shortSha  = context.sha?.slice(0, 8) || "unknown";
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  return {
+    text: `⚠️ [${context.repo}] Security scanner encountered an error — manual review required`,
+    blocks: [
+      {
+        type: "header",
+        text: { type: "plain_text", text: "⚠️  Security Scanner — Scan Failed", emoji: true },
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "> The AI security scanner could not complete its analysis. *Manual review of this commit is required.*",
+        },
+      },
+      { type: "divider" },
+      {
+        type: "section",
+        fields: [
+          { type: "mrkdwn", text: `*📁  Repository*\n<${repoUrl}|${context.repo}>` },
+          { type: "mrkdwn", text: `*👤  Actor*\n\`${context.actor}\`` },
+          { type: "mrkdwn", text: `*🔖  Commit*\n<${commitUrl}|\`${shortSha}\`>` },
+          { type: "mrkdwn", text: `*🔀  Branch*\n\`${context.ref?.replace("refs/heads/", "") || "unknown"}\`` },
+        ],
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*❌  Error Details*\n\`\`\`${errMessage.slice(0, 600)}\`\`\``,
+        },
+      },
+      { type: "divider" },
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            text: { type: "plain_text", text: "🔍 Review Commit", emoji: true },
+            url: commitUrl,
+            style: "danger",
+          },
+          {
+            type: "button",
+            text: { type: "plain_text", text: "⚙️ View Action Logs", emoji: true },
+            url: `${context.serverUrl}/${context.repo}/actions/runs/${context.runId}`,
+          },
+        ],
+      },
+      {
+        type: "context",
+        elements: [
+          {
+            type: "mrkdwn",
+            text: `🤖  *AI Security Scanner*  ·  Scan failed  ·  <!date^${timestamp}^{date_short_pretty} at {time}|${new Date().toUTCString()}>`,
+          },
+        ],
+      },
+    ],
+    attachments: [{ color: "#E01E5A", fallback: "Security scan failed — manual review required" }],
+  };
 }
 
 // ─── Send Slack notification ───────────────────────────────────────────────
 async function sendSlack(payload) {
-  const { default: fetch } = await import("node-fetch");
-
-  // Attach the channel ID to the payload (required for chat.postMessage)
-  const body = {
-    channel: SLACK_CHANNEL_ID,
-    ...payload,
-  };
+  const body = { channel: SLACK_CHANNEL_ID, ...payload };
 
   const response = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
@@ -481,7 +534,7 @@ async function sendSlack(payload) {
     throw new Error(`Slack API error: ${data.error || response.status} — ${JSON.stringify(data)}`);
   }
 
-  console.log(`✅ Slack notification sent to channel ${SLACK_CHANNEL_ID} (ts: ${data.ts})`);
+  console.log(`✅ Slack notification sent  (channel: ${SLACK_CHANNEL_ID}  ts: ${data.ts})`);
 }
 
 // ─── Write GitHub Step Summary result ─────────────────────────────────────
@@ -533,10 +586,12 @@ async function main() {
     prTitle: process.env.PR_TITLE || "",
   };
 
-  const diff = getDiff();
-  console.log(`📏 Diff size: ${diff.length} characters`);
+  const rawDiff = getDiff();
+  console.log(`📏 Raw diff size: ${rawDiff.length} characters`);
+  const diff = compressDiff(rawDiff);
+  console.log(`📦 Compressed diff size: ${diff.length} characters`);
 
-  if (diff.length === 0) {
+  if (rawDiff.length === 0) {
     console.log("ℹ️  No diff content to scan (empty diff)");
     writeResult({
       severity: "NONE",
@@ -556,6 +611,14 @@ async function main() {
     result = await callOpenAI(prompt);
   } catch (err) {
     console.error("❌ OpenAI analysis failed:", err.message);
+
+    // Still send a Slack alert so the team knows the scan failed
+    try {
+      await sendSlack(buildErrorMessage(context, err.message));
+    } catch (slackErr) {
+      console.error("❌ Also failed to send Slack error alert:", slackErr.message);
+    }
+
     process.exit(1);
   }
 
