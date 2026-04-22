@@ -2,7 +2,8 @@ const fs = require("fs");
 const path = require("path");
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const SLACK_CHANNEL_ID = process.env.SLACK_CHANNEL_ID || "C07PDMXLA2K";
 const SEVERITY_THRESHOLD = process.env.SEVERITY_THRESHOLD || "MEDIUM";
 
 const SEVERITY_LEVELS = { LOW: 1, MEDIUM: 2, HIGH: 3, CRITICAL: 4 };
@@ -335,18 +336,28 @@ function buildSlackMessage(result, context) {
 async function sendSlack(payload) {
   const { default: fetch } = await import("node-fetch");
 
-  const response = await fetch(SLACK_WEBHOOK_URL, {
+  // Attach the channel ID to the payload (required for chat.postMessage)
+  const body = {
+    channel: SLACK_CHANNEL_ID,
+    ...payload,
+  };
+
+  const response = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${SLACK_BOT_TOKEN}`,
+    },
+    body: JSON.stringify(body),
   });
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Slack webhook failed ${response.status}: ${text}`);
+  const data = await response.json();
+
+  if (!response.ok || !data.ok) {
+    throw new Error(`Slack API error: ${data.error || response.status} — ${JSON.stringify(data)}`);
   }
 
-  console.log("✅ Slack notification sent");
+  console.log(`✅ Slack notification sent to channel ${SLACK_CHANNEL_ID} (ts: ${data.ts})`);
 }
 
 // ─── Write GitHub Step Summary result ─────────────────────────────────────
@@ -379,8 +390,8 @@ async function main() {
     process.exit(1);
   }
 
-  if (!SLACK_WEBHOOK_URL) {
-    console.error("❌ SLACK_WEBHOOK_URL not set");
+  if (!SLACK_BOT_TOKEN) {
+    console.error("❌ SLACK_BOT_TOKEN not set");
     process.exit(1);
   }
 
