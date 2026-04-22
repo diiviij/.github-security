@@ -28,28 +28,34 @@ jobs:
       pull-requests: read
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      # 1️⃣ Checkout the repo being scanned
+      - name: Checkout target repository
+        uses: actions/checkout@v5
         with:
-          fetch-depth: 50 # enough history to diff
+          fetch-depth: 50
+          path: target-repo
+
+      # 2️⃣ Checkout the security scanner repo to get scan.js
+      - name: Checkout security scanner
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/.github-security
+          path: security-scanner
+          token: ${{ github.token }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install dependencies
         run: |
-          cd $GITHUB_ACTION_PATH
+          mkdir -p /tmp/scanner
           npm install --prefix /tmp/scanner node-fetch@3
-
-      - name: Download scanner script
-        run: |
-          curl -sSL https://raw.githubusercontent.com/${{ github.repository_owner }}/.github-security/main/scripts/scan.js \
-            -o /tmp/scanner/scan.js
 
       - name: Generate git diff
         id: diff
+        working-directory: target-repo
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             git fetch origin ${{ github.base_ref }} --depth=50
@@ -73,7 +79,6 @@ jobs:
               2>/dev/null | head -c 80000)
           fi
 
-          # Save diff to file to avoid env size limits
           echo "$DIFF" > /tmp/scanner/diff.txt
           DIFF_SIZE=$(wc -c < /tmp/scanner/diff.txt)
           echo "diff_size=$DIFF_SIZE" >> $GITHUB_OUTPUT
@@ -81,6 +86,7 @@ jobs:
 
       - name: Get commit metadata
         id: meta
+        working-directory: target-repo
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             COMMITS=$(git log origin/${{ github.base_ref }}...HEAD \
@@ -117,7 +123,7 @@ jobs:
           COMMITS_META: ${{ steps.meta.outputs.commits }}
           FILES_CHANGED: ${{ steps.meta.outputs.files_changed }}
           SEVERITY_THRESHOLD: ${{ inputs.severity_threshold }}
-        run: node /tmp/scanner/scan.js
+        run: node security-scanner/scripts/scan.js
 
       - name: Report scan result
         if: always()
