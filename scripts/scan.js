@@ -16,6 +16,34 @@ function getDiff() {
   return diff || "";
 }
 
+// ─── Compress diff to reduce token usage ──────────────────────────────────
+function compressDiff(diff, maxChars = 12000) {
+  const lines = diff.split("\n");
+
+  // Keep only meaningful lines: file headers, hunks, and changed lines (+/-)
+  const filtered = lines.filter((line) => {
+    return (
+      line.startsWith("diff --git") ||
+      line.startsWith("+++") ||
+      line.startsWith("---") ||
+      line.startsWith("@@") ||
+      line.startsWith("+") ||
+      line.startsWith("-")
+    );
+  });
+
+  let compressed = filtered.join("\n");
+
+  // If still too large, truncate with a notice
+  if (compressed.length > maxChars) {
+    compressed =
+      compressed.slice(0, maxChars) +
+      `\n\n... [diff truncated at ${maxChars} chars to fit token limit] ...`;
+  }
+
+  return compressed;
+}
+
 // ─── Build the security analysis prompt ───────────────────────────────────
 function buildPrompt(diff, context) {
   return `You are an expert security engineer performing a code security audit on a git diff.
@@ -405,10 +433,12 @@ async function main() {
     prTitle: process.env.PR_TITLE || "",
   };
 
-  const diff = getDiff();
-  console.log(`📏 Diff size: ${diff.length} characters`);
+  const rawDiff = getDiff();
+  console.log(`📏 Raw diff size: ${rawDiff.length} characters`);
+  const diff = compressDiff(rawDiff);
+  console.log(`📦 Compressed diff size: ${diff.length} characters`);
 
-  if (diff.length === 0) {
+  if (rawDiff.length === 0) {
     console.log("ℹ️  No diff content to scan (empty diff)");
     writeResult({
       severity: "NONE",
