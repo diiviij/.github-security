@@ -16,7 +16,7 @@ on:
     secrets:
       OPENAI_API_KEY:
         required: true
-      SLACK_WEBHOOK_URL:
+      SLACK_BOT_TOKEN:
         required: true
 
 jobs:
@@ -103,7 +103,8 @@ jobs:
         id: scan
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: "C07PDMXLA2K"
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_SHA: ${{ github.sha }}
